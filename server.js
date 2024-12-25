@@ -1,3 +1,4 @@
+// server.js
 require('dotenv').config();
 const express = require('express');
 const app = express();
@@ -14,26 +15,19 @@ const io = require('socket.io')(http, {
   pingInterval: 25000
 });
 
-// Basic route for health check
 app.get('/', (req, res) => {
   res.send('AspiTalks Server is running');
 });
 
-// Track users and rooms
-const rooms = new Map();  // room -> Set of socket IDs
-const users = new Map();  // socket ID -> room ID
-const waitingUsers = new Map(); // zone -> array of waiting users
-const debateWaitingUsers = new Map(); // questionId_choice -> array of waiting users
-const permanentUsers = new Map(); // permanent ID -> socket ID
-const reconnectPairs = new Map(); // permanent ID -> permanent ID
-const reconnectAttempts = new Map(); // permanent ID -> number of attempts
+const rooms = new Map();
+const users = new Map();
+const waitingUsers = new Map();
+const debateWaitingUsers = new Map();
+const permanentUsers = new Map();
+const reconnectPairs = new Map();
 
-// Initialize zones
-const defaultZones = ['starter_zone', 'progress_zone', 'elite_zone'];
-defaultZones.forEach(zone => waitingUsers.set(zone, []));
-
-function generateRoomId(zone) {
-  return `${zone}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+function generateRoomId(baseRoom) {
+  return `${baseRoom}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
 function logEvent(event, data) {
@@ -44,28 +38,19 @@ function handleDebateRoom(socket, data) {
   const { questionId, debateChoice, permanentId } = data;
   logEvent('Debate Join Request', { questionId, debateChoice, permanentId });
 
-  if (users.has(socket.id)) {
-    const oldRoomId = users.get(socket.id);
-    leaveRoom(socket, oldRoomId);
-  }
-
-  if (permanentId) {
-    permanentUsers.set(permanentId, socket.id);
-    logEvent('Permanent ID Mapping', `${permanentId} -> ${socket.id}`);
-  }
-
   const debateRoomKey = `${questionId}_${debateChoice}`;
   const oppositeChoice = debateChoice === 'yes' ? 'no' : 'yes';
   const oppositeRoomKey = `${questionId}_${oppositeChoice}`;
 
-  // Look for user with opposite choice
+  if (permanentId) {
+    permanentUsers.set(permanentId, socket.id);
+  }
+
   const oppositeWaitingList = debateWaitingUsers.get(oppositeRoomKey) || [];
 
   if (oppositeWaitingList.length > 0) {
-    // Found someone with opposite view - match them
     const waitingUserId = oppositeWaitingList.shift();
     if (waitingUserId && waitingUserId !== socket.id) {
-      const roomId = `debate_${questionId}_${Date.now()}`;
       const waitingSocket = io.sockets.sockets.get(waitingUserId);
 
       if (!waitingSocket) {
@@ -74,26 +59,25 @@ function handleDebateRoom(socket, data) {
         return;
       }
 
-      // Create room and connect users
-      rooms.set(roomId, new Set([waitingUserId, socket.id]));
-      users.set(waitingUserId, roomId);
-      users.set(socket.id, roomId);
+      const roomId = `debate_${questionId}_${Date.now()}`;
 
       let waitingUserPermanentId;
       permanentUsers.forEach((socketId, permId) => {
         if (socketId === waitingUserId) waitingUserPermanentId = permId;
       });
 
+      rooms.set(roomId, new Set([waitingUserId, socket.id]));
+      users.set(waitingUserId, roomId);
+      users.set(socket.id, roomId);
+
       if (waitingUserPermanentId && permanentId) {
         reconnectPairs.set(permanentId, waitingUserPermanentId);
         reconnectPairs.set(waitingUserPermanentId, permanentId);
-        logEvent('Debate Connection Pairs', `Stored: ${permanentId} <-> ${waitingUserPermanentId}`);
+        logEvent('Reconnect Pair Saved', { user1: permanentId, user2: waitingUserPermanentId });
       }
 
       waitingSocket.join(roomId);
       socket.join(roomId);
-
-      logEvent('Debate Match', `${waitingUserId}(${oppositeChoice}) <-> ${socket.id}(${debateChoice})`);
 
       io.to(waitingUserId).emit('start-call', {
         isInitiator: true,
@@ -110,70 +94,79 @@ function handleDebateRoom(socket, data) {
       });
     }
   } else {
-    // Add to waiting list for their choice
     const waitingList = debateWaitingUsers.get(debateRoomKey) || [];
     waitingList.push(socket.id);
     debateWaitingUsers.set(debateRoomKey, waitingList);
     socket.emit('waiting');
-    logEvent('Debate Waiting', `User ${socket.id} waiting for ${oppositeChoice} on question ${questionId}`);
+    logEvent('Waiting', `User ${socket.id} waiting for ${oppositeChoice} on question ${questionId}`);
   }
 }
 
 function handleNormalRoom(socket, data) {
-  const { zone, permanentId } = data;
-  const waitingList = waitingUsers.get(zone) || [];
+  const { roomId, permanentId } = data;
+  logEvent('Room Join', { roomId, permanentId });
+
+  if (permanentId) {
+    permanentUsers.set(permanentId, socket.id);
+  }
+
+  let waitingList = waitingUsers.get(roomId);
+  if (!waitingList) {
+    waitingList = [];
+    waitingUsers.set(roomId, waitingList);
+  }
 
   if (waitingList.length > 0) {
     const waitingUserId = waitingList.shift();
     if (waitingUserId && waitingUserId !== socket.id) {
-      const roomId = generateRoomId(zone);
       const waitingSocket = io.sockets.sockets.get(waitingUserId);
 
       if (!waitingSocket) {
-        logEvent('Error', 'Waiting socket not found');
         socket.emit('error', 'Failed to connect with peer');
         return;
       }
 
-      rooms.set(roomId, new Set([waitingUserId, socket.id]));
-      users.set(waitingUserId, roomId);
-      users.set(socket.id, roomId);
+      const uniqueRoomId = `${roomId}_${Date.now()}`;
 
       let waitingUserPermanentId;
       permanentUsers.forEach((socketId, permId) => {
         if (socketId === waitingUserId) waitingUserPermanentId = permId;
       });
 
+      logEvent('Connection', `Matched in ${roomId}: ${waitingUserId} <-> ${socket.id}`);
+
+      rooms.set(uniqueRoomId, new Set([waitingUserId, socket.id]));
+      users.set(waitingUserId, uniqueRoomId);
+      users.set(socket.id, uniqueRoomId);
+
       if (waitingUserPermanentId && permanentId) {
         reconnectPairs.set(permanentId, waitingUserPermanentId);
         reconnectPairs.set(waitingUserPermanentId, permanentId);
-        logEvent('Normal Connection Pairs', `Stored: ${permanentId} <-> ${waitingUserPermanentId}`);
+        logEvent('Reconnect Pair Saved', { user1: permanentId, user2: waitingUserPermanentId });
       }
 
-      waitingSocket.join(roomId);
-      socket.join(roomId);
-
-      logEvent('Normal Connection', `${waitingUserId} <-> ${socket.id}`);
+      waitingSocket.join(uniqueRoomId);
+      socket.join(uniqueRoomId);
 
       io.to(waitingUserId).emit('start-call', {
         isInitiator: true,
-        roomId,
+        roomId: uniqueRoomId,
         peerId: socket.id,
         permanentId: permanentId
       });
 
       io.to(socket.id).emit('start-call', {
         isInitiator: false,
-        roomId,
+        roomId: uniqueRoomId,
         peerId: waitingUserId,
         permanentId: waitingUserPermanentId
       });
     }
   } else {
     waitingList.push(socket.id);
-    waitingUsers.set(zone, waitingList);
+    waitingUsers.set(roomId, waitingList);
     socket.emit('waiting');
-    logEvent('Normal Waiting', `User ${socket.id} added to waiting list for ${zone}`);
+    logEvent('Waiting', `User ${socket.id} waiting in ${roomId}`);
   }
 }
 
@@ -181,31 +174,28 @@ function handleReconnect(socket, data) {
   const { myId, targetId } = data;
   logEvent('Reconnect Attempt', `User ${myId} trying to reconnect with ${targetId}`);
 
-  permanentUsers.set(myId, socket.id);
+  if (!myId || !targetId) return;
 
+  permanentUsers.set(myId, socket.id);
   const targetPair = reconnectPairs.get(targetId);
-  logEvent('Checking Pair', `Target ${targetId} has pair: ${targetPair}`);
+  logEvent('Reconnect Check', `Target ${targetId} has pair: ${targetPair}`);
 
   if (targetPair === myId) {
     const roomId = generateRoomId('reconnect');
     const targetSocketId = permanentUsers.get(targetId);
 
     if (!targetSocketId) {
-      const attempts = reconnectAttempts.get(myId) || 0;
-      reconnectAttempts.set(myId, attempts + 1);
       socket.emit('waiting');
-      logEvent('Reconnect Waiting', `Waiting for peer ${targetId} to connect (attempt ${attempts + 1})`);
       return;
     }
 
     const targetSocket = io.sockets.sockets.get(targetSocketId);
     if (!targetSocket) {
-      logEvent('Reconnect Info', 'Peer connection pending');
       socket.emit('waiting');
       return;
     }
 
-    reconnectAttempts.delete(myId);
+    logEvent('Reconnect Success', { roomId, user1: myId, user2: targetId });
 
     rooms.set(roomId, new Set([socket.id, targetSocketId]));
     users.set(socket.id, roomId);
@@ -230,8 +220,6 @@ function handleReconnect(socket, data) {
 
     reconnectPairs.delete(myId);
     reconnectPairs.delete(targetId);
-
-    logEvent('Reconnect Success', `Matched ${myId} <-> ${targetId}`);
   } else {
     reconnectPairs.set(myId, targetId);
     socket.emit('waiting');
@@ -239,43 +227,10 @@ function handleReconnect(socket, data) {
   }
 }
 
-function leaveRoom(socket, roomId) {
-  if (!roomId) return;
-
-  const room = rooms.get(roomId);
-  if (room) {
-    const otherUser = Array.from(room).find(id => id !== socket.id);
-
-    if (otherUser) {
-      let disconnectedPermanentId, otherPermanentId;
-      permanentUsers.forEach((socketId, permanentId) => {
-        if (socketId === socket.id) disconnectedPermanentId = permanentId;
-        if (socketId === otherUser) otherPermanentId = permanentId;
-      });
-
-      if (disconnectedPermanentId && otherPermanentId) {
-        reconnectPairs.set(disconnectedPermanentId, otherPermanentId);
-        reconnectPairs.set(otherPermanentId, disconnectedPermanentId);
-        logEvent('Reconnect Pairs', `Stored: ${disconnectedPermanentId} <-> ${otherPermanentId}`);
-      }
-
-      io.to(otherUser).emit('user-disconnected', {
-        disconnectedId: disconnectedPermanentId
-      });
-      users.delete(otherUser);
-    }
-
-    rooms.delete(roomId);
-    users.delete(socket.id);
-  }
-}
-
-// Socket connection handling
 io.on('connection', (socket) => {
   logEvent('Connection', `New user connected: ${socket.id}`);
 
   socket.on('join-room', (data) => {
-    logEvent('Join Room Request', data);
     if (data.isDebate) {
       handleDebateRoom(socket, data);
     } else {
@@ -284,7 +239,6 @@ io.on('connection', (socket) => {
   });
 
   socket.on('join-reconnect', (data) => {
-    logEvent('Join Reconnect', `User ${socket.id} trying to reconnect`);
     handleReconnect(socket, data);
   });
 
@@ -344,7 +298,7 @@ io.on('connection', (socket) => {
           if (disconnectedPermanentId && otherPermanentId) {
             reconnectPairs.set(disconnectedPermanentId, otherPermanentId);
             reconnectPairs.set(otherPermanentId, disconnectedPermanentId);
-            logEvent('Reconnect Pairs', `Stored: ${disconnectedPermanentId} <-> ${otherPermanentId}`);
+            logEvent('Reconnect Available', `${disconnectedPermanentId} <-> ${otherPermanentId}`);
           }
 
           io.to(otherUser).emit('user-disconnected', {
@@ -357,26 +311,26 @@ io.on('connection', (socket) => {
     }
 
     if (disconnectedPermanentId) {
-      reconnectAttempts.delete(disconnectedPermanentId);
       permanentUsers.delete(disconnectedPermanentId);
     }
 
-    // Clean up regular waiting lists
-    waitingUsers.forEach((list, zone) => {
-      if (Array.isArray(list)) {
-        const index = list.indexOf(socket.id);
-        if (index > -1) {
-          list.splice(index, 1);
+    // Clean up waiting lists
+    waitingUsers.forEach((list, key) => {
+      const index = list.indexOf(socket.id);
+      if (index > -1) {
+        list.splice(index, 1);
+        if (list.length === 0) {
+          waitingUsers.delete(key);
         }
       }
     });
 
-    // Clean up debate waiting lists
     debateWaitingUsers.forEach((list, key) => {
-      if (Array.isArray(list)) {
-        const index = list.indexOf(socket.id);
-        if (index > -1) {
-          list.splice(index, 1);
+      const index = list.indexOf(socket.id);
+      if (index > -1) {
+        list.splice(index, 1);
+        if (list.length === 0) {
+          debateWaitingUsers.delete(key);
         }
       }
     });
@@ -399,7 +353,6 @@ process.on('unhandledRejection', (error) => {
   process.exit(1);
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 http.listen(PORT, '0.0.0.0', () => {
   console.log(`\n=================================`);
