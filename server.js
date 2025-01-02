@@ -1,4 +1,3 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const app = express();
@@ -25,6 +24,7 @@ const waitingUsers = new Map();
 const debateWaitingUsers = new Map();
 const permanentUsers = new Map();
 const reconnectPairs = new Map();
+const activeReconnectUsers = new Map();
 
 function generateRoomId(baseRoom) {
   return `${baseRoom}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -176,13 +176,34 @@ function handleReconnect(socket, data) {
 
   if (!myId || !targetId) return;
 
+  // Store that this user wants to reconnect
+  activeReconnectUsers.set(myId, {
+    socketId: socket.id,
+    targetId: targetId
+  });
+
   permanentUsers.set(myId, socket.id);
   const targetPair = reconnectPairs.get(targetId);
   logEvent('Reconnect Check', `Target ${targetId} has pair: ${targetPair}`);
 
   if (targetPair === myId) {
-    const roomId = generateRoomId('reconnect');
+    // Check if target user is also actively trying to reconnect
+    const targetReconnectData = activeReconnectUsers.get(targetId);
+    if (!targetReconnectData || targetReconnectData.targetId !== myId) {
+      socket.emit('waiting');
+      return;
+    }
+
     const targetSocketId = permanentUsers.get(targetId);
+
+    // Check if target user is in another active room
+    const targetCurrentRoom = Array.from(rooms.entries()).find(([_, users]) =>
+      users.has(targetSocketId)
+    );
+    if (targetCurrentRoom) {
+      socket.emit('waiting');
+      return;
+    }
 
     if (!targetSocketId) {
       socket.emit('waiting');
@@ -195,6 +216,7 @@ function handleReconnect(socket, data) {
       return;
     }
 
+    const roomId = generateRoomId('reconnect');
     logEvent('Reconnect Success', { roomId, user1: myId, user2: targetId });
 
     rooms.set(roomId, new Set([socket.id, targetSocketId]));
@@ -218,6 +240,9 @@ function handleReconnect(socket, data) {
       permanentId: myId
     });
 
+    // Clear reconnect status for both users
+    activeReconnectUsers.delete(myId);
+    activeReconnectUsers.delete(targetId);
     reconnectPairs.delete(myId);
     reconnectPairs.delete(targetId);
   } else {
@@ -240,6 +265,14 @@ io.on('connection', (socket) => {
 
   socket.on('join-reconnect', (data) => {
     handleReconnect(socket, data);
+  });
+
+  socket.on('leave-reconnect', () => {
+    permanentUsers.forEach((socketId, permanentId) => {
+      if (socketId === socket.id) {
+        activeReconnectUsers.delete(permanentId);
+      }
+    });
   });
 
   socket.on('offer', (data) => {
@@ -281,6 +314,11 @@ io.on('connection', (socket) => {
         disconnectedPermanentId = permanentId;
       }
     });
+
+    // Clear reconnect status for disconnected user
+    if (disconnectedPermanentId) {
+      activeReconnectUsers.delete(disconnectedPermanentId);
+    }
 
     const roomId = users.get(socket.id);
     if (roomId) {
